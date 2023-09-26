@@ -81,6 +81,10 @@ static bool isInit = false;
 #define GAP8_MAX_MEM_WRITE_TIMEOUT_MS 5000
 #define GAP8_MAX_MEM_VERIFY_TIMEOUT_MS 5000
 
+
+float aideckPosx, aideckPosy, aideckPosz;
+
+
 typedef struct {
   uint8_t cmd;
   uint32_t startAddress;
@@ -309,6 +313,44 @@ uint8_t espDeckFlasherPropertiesQuery()
   #endif
 
 
+float bytesToFloat(const uint8_t *bytes) {
+    float result;
+    uint32_t rawValue;
+
+    // Assuming little-endian byte order
+    rawValue = (uint32_t)(bytes[0]) |
+               ((uint32_t)(bytes[1]) << 8) |
+               ((uint32_t)(bytes[2]) << 16) |
+               ((uint32_t)(bytes[3]) << 24);
+
+    // Typecast the raw integer value to float
+    result = *((float*)&rawValue);
+
+    return result;
+}
+
+void aideckTask(void *param){
+  
+  
+    systemWaitStart();
+    vTaskDelay(M2T(1000));
+
+    CPXRoutablePacket_t rxPacket;
+    while (1){
+
+      cpxUARTTransportReceive(&rxPacket);
+      
+      aideckPosx = bytesToFloat(&rxPacket.data[0]);
+      aideckPosy = bytesToFloat(&rxPacket.data[4]);
+      aideckPosz = bytesToFloat(&rxPacket.data[8]);
+
+      //estimatorEnqueueDistance(&dist);
+    }
+
+    /* something went wrong */
+    vTaskDelete(NULL);
+}
+
 static void aideckInit(DeckInfo *info)
 {
   if (isInit)
@@ -326,8 +368,7 @@ static void aideckInit(DeckInfo *info)
   cpxUARTTransportInit();
   cpxInternalRouterInit();
   cpxExternalRouterInit();
-  cpxInit();
-
+  cpxInit(); 
   // Release reset for GAP8/ESP32
   digitalWrite(DECK_GPIO_IO4, HIGH);
   pinMode(DECK_GPIO_IO4, INPUT_PULLUP);
@@ -337,7 +378,7 @@ static void aideckInit(DeckInfo *info)
 #else
   setupWiFi();
 #endif
-
+  xTaskCreate(aideckTask, AI_DECK_GAP_TASK_NAME, AI_DECK_TASK_STACKSIZE, NULL, AI_DECK_TASK_PRI, NULL);
   isInit = true;
 }
 
@@ -388,6 +429,13 @@ static const DeckDriver aideck_deck = {
 
 /** @addtogroup deck
 */
+LOG_GROUP_START(aideck)
+LOG_ADD(LOG_FLOAT, aiposx, &aideckPosx)
+LOG_ADD(LOG_FLOAT, aiposy, &aideckPosy)
+LOG_ADD(LOG_FLOAT, aiposz, &aideckPosz)
+LOG_GROUP_STOP(aideck)
+
+
 PARAM_GROUP_START(deck)
 
 /**
