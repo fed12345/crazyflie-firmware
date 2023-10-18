@@ -1,3 +1,5 @@
+#define DEBUG_MODULE "CONTROLLER"
+#include "debug.h"
 #include "stabilizer_types.h"
 
 #include "attitude_controller.h"
@@ -13,7 +15,7 @@
 #define ATTITUDE_UPDATE_DT    (float)(1.0f/ATTITUDE_RATE)
 
 static attitude_t attitudeDesired;
-static attitude_t rateDesired;
+//static attitude_t rateDesired;
 static float actuatorThrust = 0;
 
 static float cmd_thrust;
@@ -24,12 +26,13 @@ static float r_roll;
 static float r_pitch;
 static float r_yaw;
 static float accelz;
-static float network_input[1][17];
-static float network_output[1][4];
+static float nn_input[1][13];
 static uint32_t time;
+float nn_output[1][4];
 
 void controllerNetInit(void)
 {
+    DEBUG_PRINT("controllerNetInit\n");
     attitudeControllerResetAllPID();
     positionControllerResetAllPID();
     usecTimerInit();
@@ -48,37 +51,26 @@ void controllerNet(control_t *control, const setpoint_t *setpoint,
 {
     control->controlMode = controlModeLegacy;
     uint64_t start = usecTimestamp();
-    // if (RATE_DO_EXECUTE(ATTITUDE_RATE, stabilizerStep)) {
-        network_input[0][0] = setpoint->position.x;
-        network_input[0][1] = setpoint->position.y;
-        network_input[0][2] = setpoint->position.z;
-        network_input[0][3] = setpoint->velocity.x;
-        network_input[0][4] = setpoint->velocity.y;
-        network_input[0][5] = setpoint->velocity.z;
-        network_input[0][6] = state->attitude.roll;
-        network_input[0][7] = state->attitude.pitch;
-        network_input[0][8] = state->attitude.yaw;
-        network_input[0][9] = sensors->gyro.x; //rollrate
-        network_input[0][10] = -sensors->gyro.y; //pitchrate
-        network_input[0][11] = sensors->gyro.z; //yawrate
-        network_input[0][12] = sensors->acc.z;
-        network_input[0][13] = control->roll;
-        network_input[0][14] = control->pitch;
-        network_input[0][15] = control->yaw;
-        network_input[0][16] = control->thrust;
-        
-        entry(network_input, network_output);
+
+    if (RATE_DO_EXECUTE(POSITION_RATE, stabilizerStep)) {
+    positionController(&actuatorThrust, &attitudeDesired, setpoint, state);
+
+    }
+    
+    if (RATE_DO_EXECUTE(NET_RATE, stabilizerStep)) {
         time = start - usecTimestamp();
+
+        nn_control(control, sensors, state, nn_output[0]);
         // This is the part I keep
         attitudeControllerCorrectRatePID(sensors->gyro.x, -sensors->gyro.y, sensors->gyro.z,
-                                network_output[0][0], network_output[0][2], network_output[0][3]);
+                                nn_output[0][0], nn_output[0][2], nn_output[0][3]);
 
         attitudeControllerGetActuatorOutput(&control->roll,
                                             &control->pitch,
                                             &control->yaw);
 
         control->yaw = -control->yaw;
-        control->thrust = network_output[0][4];
+        control->thrust = nn_output[0][4]*4998.66013476f;
         
         cmd_thrust = control->thrust;
         cmd_roll = control->roll;
@@ -88,8 +80,9 @@ void controllerNet(control_t *control, const setpoint_t *setpoint,
         r_pitch = -radians(sensors->gyro.y);
         r_yaw = radians(sensors->gyro.z);
         accelz = sensors->acc.z;
-    //}
-  control->thrust = actuatorThrust;
+    }
+
+  //control->thrust = actuatorThrust;
 
   if (control->thrust == 0)
   {
@@ -111,11 +104,179 @@ void controllerNet(control_t *control, const setpoint_t *setpoint,
   }
 }
 
+bool deterministic = true;
+
+const float output_std[4] = {
+    0.9520828127861023,
+    0.9748178124427795,
+    0.9901017546653748,
+    0.8914892077445984,
+};
+
+const float gate_pos[NUM_GATES][3] = {
+    {2.0, -1.5, -1.5},
+    {2.0, 1.5, -1.5},
+    {-2.0, 1.5, -1.5},
+    {-2.0, -1.5, -1.5},
+    {2.0, -1.5, -1.5},
+    {2.0, 1.5, -1.5},
+    {-2.0, 1.5, -1.5},
+    {-2.0, -1.5, -1.5},
+};
+
+const float gate_yaw[NUM_GATES] = {
+    0.7853981852531433,
+    2.356194496154785,
+    3.9269907474517822,
+    5.497786998748779,
+    0.7853981852531433,
+    2.356194496154785,
+    3.9269907474517822,
+    5.497786998748779,
+};
+
+const float start_pos[3] = {
+    -2.0, -1.5, -1.5
+};
+
+const float gate_pos_rel[NUM_GATES][3] = {
+    {2.8284265995025635, 2.82842755317688, 0.0},
+    {2.1213202476501465, 2.1213202476501465, 0.0},
+    {2.8284270763397217, 2.8284270763397217, 0.0},
+    {2.1213202476501465, 2.1213204860687256, 0.0},
+    {2.8284265995025635, 2.82842755317688, 0.0},
+    {2.1213202476501465, 2.1213202476501465, 0.0},
+    {2.8284270763397217, 2.8284270763397217, 0.0},
+    {2.1213202476501465, 2.1213204860687256, 0.0},
+};
+
+const float gate_yaw_rel[NUM_GATES] = {
+    -4.71238899230957,
+    1.570796251296997,
+    1.570796251296997,
+    1.570796251296997,
+    -4.71238899230957,
+    1.570796251296997,
+    1.570796251296997,
+    1.570796251296997,
+};
+
+uint8_t target_gate_index = 0;
+float pos[3];
+float vel[3];
+
+void nn_reset() {
+    target_gate_index = 0;
+}
+
+float deg2rad(float deg){
+    return deg * 3.1415f / 180.0f;
+}
+
+float rad2deg(float rad){
+    return rad * 180.0f / 3.1415f;
+}
+
+void nn_control(control_t *control,const sensorData_t *sensors, const state_t *state, float indi_cmd[4]) {
+    // Get the current position, velocity and heading
+    pos[0] = state->position.x;
+    pos[1] = state->position.y;
+    pos[2] = -state->position.z;
+
+    vel[0] = state->velocity.x;
+    vel[1] = state->velocity.y;
+    vel[2] = -state->velocity.z;
+
+
+    // set the position and heading of the target gate
+    float target_pos[3] = {gate_pos[target_gate_index][0], gate_pos[target_gate_index][1], gate_pos[target_gate_index][2]};
+    float target_yaw = gate_yaw[target_gate_index];
+
+    // Set the target gate index to the next gate if we passed through the current one
+    if (cosf(target_yaw) * (pos[0] - target_pos[0]) + sinf(target_yaw) * (pos[1] - target_pos[1]) > 0) {
+        target_gate_index++;
+        // loop back to the first gate if we reach the end
+        target_gate_index = target_gate_index % NUM_GATES;
+        // reset the target position and heading
+        target_pos[0] = gate_pos[target_gate_index][0];
+        target_pos[1] = gate_pos[target_gate_index][1];
+        target_pos[2] = gate_pos[target_gate_index][2];
+        target_yaw = gate_yaw[target_gate_index];
+    }
+
+    // Get the position of the drone in gate frame
+    float pos_rel[3] = {
+        cosf(target_yaw) * (pos[0] - target_pos[0]) + sinf(target_yaw) * (pos[1] - target_pos[1]),
+        -sinf(target_yaw) * (pos[0] - target_pos[0]) + cosf(target_yaw) * (pos[1] - target_pos[1]),
+        pos[2] - target_pos[2]
+    };
+
+    // Get the velocity of the drone in gate frame
+    float vel_rel[3] = {
+        cosf(target_yaw) * vel[0] + sinf(target_yaw) * vel[1],
+        -sinf(target_yaw) * vel[0] + cosf(target_yaw) * vel[1],
+        vel[2]
+    };
+
+    // Get the heading of the drone in gate frame
+    float yaw_rel = -deg2rad(state->attitude.yaw) - target_yaw;
+    while (yaw_rel > 3.1415f) {yaw_rel -= 2*3.1415f;}
+    while (yaw_rel < -3.1415f) {yaw_rel += 2*3.1415f;}
+
+    // position and velocity
+    for (int i = 0; i < 3; i++) {
+        nn_input[1][i] = pos_rel[i];
+        nn_input[1][i+3] = vel_rel[i];
+    }
+    // attitude
+    nn_input[1][6] = deg2rad(state->attitude.roll); // roll
+    nn_input[1][7] = deg2rad(state->attitude.pitch); // pitch
+    nn_input[1][8] = yaw_rel; // yaw
+    // body rates
+    nn_input[1][9] = deg2rad(sensors->gyro.x); // p
+    nn_input[1][10] = deg2rad(-sensors->gyro.y); // q
+    nn_input[1][11] = deg2rad(-sensors->gyro.z); // r
+
+    nn_input[1][12] = sensors->acc.z * 9.81f; // z acceleration
+
+    // relative gate positions and headings
+    for (int i = 0; i < GATES_AHEAD; i++) {
+        uint8_t index = target_gate_index + i + 1;
+        // loop back to the first gate if we reach the end
+        index = index % NUM_GATES;
+        nn_input[1][13+4*i]   = gate_pos_rel[index][0];
+        nn_input[1][13+4*i+1] = gate_pos_rel[index][1];
+        nn_input[1][13+4*i+2] = gate_pos_rel[index][2];
+        nn_input[1][13+4*i+3] = gate_yaw_rel[index];
+    }
+    // Get the neural network output and write to the action array
+    entry(nn_input, nn_output);
+
+    for (int i = 0; i < 4; i++) {
+        // clip the output to the range [-1, 1]
+        if (nn_output[1][i] > 1) {nn_output[1][i] = 1;}
+        if (nn_output[1][i] < -1) {nn_output[1][i] = -1;}
+    }
+    // map the output to the correct ranges
+    float p_min = -1.0;
+    float p_max = 1.0;
+    float q_min = -1.0;
+    float q_max = 1.0;
+    float r_min = -1.0;
+    float r_max = 1.0;
+    float T_min = 0.0;
+    float T_max = 1.15*9.81;
+    indi_cmd[0] = rad2deg((nn_output[1][0] + 1) / 2 * (p_max - p_min) + p_min);
+    indi_cmd[1] = rad2deg((nn_output[1][1] + 1) / 2 * (q_max - q_min) + q_min);
+    indi_cmd[2] = rad2deg((nn_output[1][2] + 1) / 2 * (r_max - r_min) + r_min);
+    indi_cmd[3] = rad2deg((nn_output[1][3] + 1) / 2 * (T_max - T_min) + T_min);
+}
+
 /**
  * Logging variables for the command and reference signals for the
  * altitude PID controller
  */
-LOG_GROUP_START(controller)
+LOG_GROUP_START(controllerNetLog)
 /**
  * @brief Thrust command
  */
@@ -133,18 +294,6 @@ LOG_ADD(LOG_FLOAT, cmd_pitch, &cmd_pitch)
  */
 LOG_ADD(LOG_FLOAT, cmd_yaw, &cmd_yaw)
 /**
- * @brief Gyro roll measurement in radians
- */
-LOG_ADD(LOG_FLOAT, r_roll, &r_roll)
-/**
- * @brief Gyro pitch measurement in radians
- */
-LOG_ADD(LOG_FLOAT, r_pitch, &r_pitch)
-/**
- * @brief Yaw  measurement in radians
- */
-LOG_ADD(LOG_FLOAT, r_yaw, &r_yaw)
-/**
  * @brief Acceleration in the zaxis in G-force
  */
 LOG_ADD(LOG_FLOAT, accelz, &accelz)
@@ -152,34 +301,10 @@ LOG_ADD(LOG_FLOAT, accelz, &accelz)
  * @brief Thrust command without (tilt)compensation
  */
 LOG_ADD(LOG_FLOAT, actuatorThrust, &actuatorThrust)
-/**
- * @brief Desired roll setpoint
- */
-LOG_ADD(LOG_FLOAT, roll,      &attitudeDesired.roll)
-/**
- * @brief Desired pitch setpoint
- */
-LOG_ADD(LOG_FLOAT, pitch,     &attitudeDesired.pitch)
-/**
- * @brief Desired yaw setpoint
- */
-LOG_ADD(LOG_FLOAT, yaw,       &attitudeDesired.yaw)
-/**
- * @brief Desired roll rate setpoint
- */
-LOG_ADD(LOG_FLOAT, rollRate,  &rateDesired.roll)
-/**
- * @brief Desired pitch rate setpoint
- */
-LOG_ADD(LOG_FLOAT, pitchRate, &rateDesired.pitch)
-/**
- * @brief Desired yaw rate setpoint
- */
-LOG_ADD(LOG_FLOAT, yawRate,   &rateDesired.yaw)
 
 /**
  * @brief Time
  */
 LOG_ADD(LOG_UINT32, time, &time)
 
-LOG_GROUP_STOP(controller)
+LOG_GROUP_STOP(controllerNetLog)
