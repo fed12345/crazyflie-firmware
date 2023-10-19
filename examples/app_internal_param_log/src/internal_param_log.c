@@ -78,7 +78,6 @@ float posExt[3] = {0,0,0};
 float posSetpoint[3] = {0,0,0};
 static enum State state = IDLE;
 uint8_t takeoffSwitch = 0;
-uint8_t controllerNumber = 1;
 void appMain()
 {
   DEBUG_PRINT("This is the GateNet app...\n");
@@ -90,7 +89,6 @@ void appMain()
 
   paramVarId_t paramIdStabilizerController = paramGetVarId("stabilizer", "controller");
   // Set the controller to net
-  controllerNumber = 1;
   paramSetInt(paramIdStabilizerController, 1);
 
   while(1) {
@@ -123,7 +121,6 @@ void appMain()
     case START_POS:
       if(crtpCommanderHighLevelIsTrajectoryFinished()){
         state = WAIT_FOR_RACE;
-        controllerNumber = 5;
         paramSetInt(paramIdStabilizerController, 5);
       }
       break;
@@ -134,7 +131,6 @@ void appMain()
     case RACE:
       if(crtpCommanderHighLevelIsTrajectoryFinished()){
         state = WAIT_FOR_LANDING;
-        controllerNumber = 1;
         paramSetInt(paramIdStabilizerController, 1);
       }
       break;
@@ -162,7 +158,3 @@ PARAM_ADD_CORE(PARAM_UINT8, flightmode, &flightmode)
 PARAM_ADD_CORE(PARAM_UINT8, takeoffSwitch, &takeoffSwitch)
 PARAM_GROUP_STOP(app_flight)
 
-LOG_GROUP_START(app_flight)
-LOG_ADD(LOG_INT8, controllerNumber, &controllerNumber)
-
-LOG_GROUP_STOP(app_flight)
