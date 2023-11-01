@@ -26,27 +26,15 @@ static float r_roll;
 static float r_pitch;
 static float r_yaw;
 static float accelz;
-static float nn_input[1][13];
 static uint32_t time;
-float nn_output[1][4];
+static float world_state[13];
+static float indi_cmd[4];
 
-float nn_in0;
-float nn_in1;
-float nn_in2;
-float nn_in3;
-float nn_in4;
-float nn_in5;
-float nn_in6;
-float nn_in7;
-float nn_in8;
-float nn_in9;
-float nn_in10;
-float nn_in11;
-float nn_in12;
 float nn_out0;
 float nn_out1;
 float nn_out2;
 float nn_out3;
+
 
 void controllerNetInit(void)
 {
@@ -77,18 +65,30 @@ void controllerNet(control_t *control, const setpoint_t *setpoint,
     
     if (RATE_DO_EXECUTE(NET_RATE, stabilizerStep)) {
         time = start - usecTimestamp();
-
-        nn_control(control, sensors, state);
+        world_state[0] = state->position.x;
+        world_state[1] = -state->position.y;
+        world_state[2] = -state->position.z;
+        world_state[3] = state->velocity.x;
+        world_state[4] = -state->velocity.y;
+        world_state[5] = -state->velocity.z;
+        world_state[6] = radians(state->attitude.roll);
+        world_state[7] = radians(state->attitude.pitch);
+        world_state[8] = -radians(state->attitude.yaw);
+        world_state[9] = radians(sensors->gyro.x);
+        world_state[10] = -radians(sensors->gyro.y);
+        world_state[11] = -radians(sensors->gyro.z);
+        world_state[12] = sensors->acc.z*9.81f;
+        nn_control(world_state, indi_cmd);
         // This is the part I keep
         attitudeControllerCorrectRatePID(sensors->gyro.x, -sensors->gyro.y, sensors->gyro.z,
-                                nn_output[0][0], nn_output[0][1], nn_output[0][2]);
+                                degrees(indi_cmd[0]), degrees(indi_cmd[1]), -degrees(indi_cmd[2]));
 
         attitudeControllerGetActuatorOutput(&control->roll,
                                             &control->pitch,
                                             &control->yaw);
 
         control->yaw = -control->yaw;
-        control->thrust =  nn_output[0][3]*4998.66013476f;
+        control->thrust =  indi_cmd[3]*4711.54490755f;
         
         cmd_thrust = control->thrust;
         cmd_roll = control->roll;
@@ -195,18 +195,13 @@ float rad2deg(float rad){
     return rad * 180.0f / 3.1415f;
 }
 
-void nn_control(control_t *control, const sensorData_t *sensors, const state_t *state) {
+void nn_control(const float world_state[13], float indi_cmd[4]) {
     // Get the current position, velocity and heading
-    pos[0] = state->position.x;
-    pos[1] = state->position.y;
-    pos[2] = -state->position.z;
+    float pos[3] = {world_state[0], world_state[1], world_state[2]};
+    float vel[3] = {world_state[3], world_state[4], world_state[5]};
+    float yaw = world_state[8];
 
-    
-    vel[0] = state->velocity.x;
-    vel[1] = state->velocity.y;
-    vel[2] = -state->velocity.z;
-
-    // set the position and heading of the target gate
+    // Get the position and heading of the target gate
     float target_pos[3] = {gate_pos[target_gate_index][0], gate_pos[target_gate_index][1], gate_pos[target_gate_index][2]};
     float target_yaw = gate_yaw[target_gate_index];
 
@@ -237,82 +232,68 @@ void nn_control(control_t *control, const sensorData_t *sensors, const state_t *
     };
 
     // Get the heading of the drone in gate frame
-    float yaw_rel = -deg2rad(state->attitude.yaw) - target_yaw;
-    while (yaw_rel > 3.1415f) {yaw_rel -= 2*3.1415f;}
-    while (yaw_rel < -3.1415f) {yaw_rel += 2*3.1415f;}
+    float yaw_rel = yaw - target_yaw;
+    while (yaw_rel > 3.14f) {yaw_rel -= 2*3.14f;}
+    while (yaw_rel < -3.14f) {yaw_rel += 2*3.14f;}
 
+    // Get the neural network input
+    float nn_input[13+4*GATES_AHEAD];
     // position and velocity
     for (int i = 0; i < 3; i++) {
-        nn_input[0][i] = pos_rel[i];
-        nn_input[0][i+3] = vel_rel[i];
+        nn_input[i] = pos_rel[i];
+        nn_input[i+3] = vel_rel[i];
     }
-    
     // attitude
-    nn_input[0][6] = deg2rad(state->attitude.roll); // roll
-    nn_input[0][7] = deg2rad(state->attitude.pitch); // pitch
-    nn_input[0][8] = yaw_rel; // yaw
+    nn_input[6] = world_state[6];
+    nn_input[7] = world_state[7];
+    nn_input[8] = yaw_rel;
     // body rates
-    nn_input[0][9] = deg2rad(sensors->gyro.x); // p
-    nn_input[0][10] = deg2rad(-sensors->gyro.y); // q
-    nn_input[0][11] = deg2rad(-sensors->gyro.z); // r
-
-    nn_input[0][12] = sensors->acc.z * 9.81f; // z acceleration
+    nn_input[9] = world_state[9];
+    nn_input[10] = world_state[10];
+    nn_input[11] = world_state[11];
+    // normalized thrust 
+    float T_min = 0.8*9.81;
+    float T_max = 1.08*9.81;
+    nn_input[12] = (world_state[12] - T_min) / (T_max - T_min) * 2 - 1;
 
     // relative gate positions and headings
     for (int i = 0; i < GATES_AHEAD; i++) {
         uint8_t index = target_gate_index + i + 1;
         // loop back to the first gate if we reach the end
         index = index % NUM_GATES;
-        nn_input[0][13+4*i]   = gate_pos_rel[index][0];
-        nn_input[0][13+4*i+1] = gate_pos_rel[index][1];
-        nn_input[0][13+4*i+2] = gate_pos_rel[index][2];
-        nn_input[0][13+4*i+3] = gate_yaw_rel[index];
+        nn_input[13+4*i]   = gate_pos_rel[index][0];
+        nn_input[13+4*i+1] = gate_pos_rel[index][1];
+        nn_input[13+4*i+2] = gate_pos_rel[index][2];
+        nn_input[13+4*i+3] = gate_yaw_rel[index];
     }
     // Get the neural network output and write to the action array
-   
-    entry(nn_input, nn_output);
+    float nn_output[1][4];
+    float net_input[1][13];
+    for (int i = 0; i < 13; i++) {
+        net_input[0][i] = nn_input[i];
+    }
 
-    // For logging
-    nn_in0 = nn_input[0][0];
-    nn_in1 = nn_input[0][1];
-    nn_in2 = nn_input[0][2];
-    nn_in3 = nn_input[0][3];
-    nn_in4 = nn_input[0][4];
-    nn_in5 = nn_input[0][5];
-    nn_in6 = nn_input[0][6];
-    nn_in7 = nn_input[0][7];
-    nn_in8 = nn_input[0][8];
-    nn_in9 = nn_input[0][9];
-    nn_in10 = nn_input[0][10];
-    nn_in11 = nn_input[0][11];
-    nn_in12 = nn_input[0][12];
-
-
+    entry(net_input, nn_output);
     nn_out0 = nn_output[0][0];
     nn_out1 = nn_output[0][1];
     nn_out2 = nn_output[0][2];
     nn_out3 = nn_output[0][3];
-
-    //DEBUG_PRINT("nn_output: %f, %f, %f, %f\n",(double) nn_output[0][0],(double) nn_output[0][1], (double) nn_output[0][2], (double) nn_output[0][3]);
     for (int i = 0; i < 4; i++) {
         // clip the output to the range [-1, 1]
         if (nn_output[0][i] > 1) {nn_output[0][i] = 1;}
         if (nn_output[0][i] < -1) {nn_output[0][i] = -1;}
     }
     // map the output to the correct ranges
-    float p_min = -1.0;
-    float p_max = 1.0;
-    float q_min = -1.0;
-    float q_max = 1.0;
-    float r_min = -1.0;
-    float r_max = 1.0;
-    float T_min = 0.0;
-    float T_max = 1.15*9.81;
-    nn_output[0][0] = rad2deg((nn_output[0][0] + 1) / 2 * (p_max - p_min) + p_min);
-    nn_output[0][1] = rad2deg((nn_output[0][1] + 1) / 2 * (q_max - q_min) + q_min);
-    nn_output[0][2] = rad2deg((nn_output[0][2] + 1) / 2 * (r_max - r_min) + r_min);
-    nn_output[0][3] = rad2deg((nn_output[0][3] + 1) / 2 * (T_max - T_min) + T_min);
-   
+    float p_min = -0.2;
+    float p_max = 0.2;
+    float q_min = -0.2;
+    float q_max = 0.2;
+    float r_min = -0.6;
+    float r_max = 0.6;
+    indi_cmd[0] = (nn_output[0][0] + 1) / 2 * (p_max - p_min) + p_min;
+    indi_cmd[1] = (nn_output[0][1] + 1) / 2 * (q_max - q_min) + q_min;
+    indi_cmd[2] = (nn_output[0][2] + 1) / 2 * (r_max - r_min) + r_min;
+    indi_cmd[3] = (nn_output[0][3] + 1) / 2 * (T_max - T_min) + T_min;
 }
 
 LOG_GROUP_START(nncontrol)
@@ -320,22 +301,23 @@ LOG_ADD(LOG_FLOAT, cmd_thrust, &cmd_thrust)
 LOG_ADD(LOG_FLOAT, cmd_roll, &cmd_roll)
 LOG_ADD(LOG_FLOAT, cmd_pitch, &cmd_pitch)
 LOG_ADD(LOG_FLOAT, cmd_yaw, &cmd_yaw)
-LOG_ADD(LOG_FLOAT, n_in0, &nn_in0)
-LOG_ADD(LOG_FLOAT, n_in1, &nn_in1)
-LOG_ADD(LOG_FLOAT, n_in2, &nn_in2)
-LOG_ADD(LOG_FLOAT, n_in3, &nn_in3)
-LOG_ADD(LOG_FLOAT, n_in4, &nn_in4)
-LOG_ADD(LOG_FLOAT, n_in5, &nn_in5)
-LOG_ADD(LOG_FLOAT, n_in6, &nn_in6)
-LOG_ADD(LOG_FLOAT, n_in7, &nn_in7)
-LOG_ADD(LOG_FLOAT, n_in8, &nn_in8)
-LOG_ADD(LOG_FLOAT, n_in9, &nn_in9)
-LOG_ADD(LOG_FLOAT, n_in10, &nn_in10)
-LOG_ADD(LOG_FLOAT, n_in11, &nn_in11)
-LOG_ADD(LOG_FLOAT, n_in12, &nn_in12)
-LOG_ADD(LOG_FLOAT, n_out0, &nn_out0)
-LOG_ADD(LOG_FLOAT, n_out1, &nn_out1)
-LOG_ADD(LOG_FLOAT, n_out2, &nn_out2)
-LOG_ADD(LOG_FLOAT, n_out3, &nn_out3)
+LOG_ADD(LOG_FLOAT, n_in0, &world_state[0])
+LOG_ADD(LOG_FLOAT, n_in1, &world_state[1])
+LOG_ADD(LOG_FLOAT, n_in2, &world_state[2])  
+LOG_ADD(LOG_FLOAT, n_in3, &world_state[3])
+LOG_ADD(LOG_FLOAT, n_in4, &world_state[4])
+LOG_ADD(LOG_FLOAT, n_in5, &world_state[5])
+LOG_ADD(LOG_FLOAT, n_in6, &world_state[6])
+LOG_ADD(LOG_FLOAT, n_in7, &world_state[7])
+LOG_ADD(LOG_FLOAT, n_in8, &world_state[8])
+LOG_ADD(LOG_FLOAT, n_in9, &world_state[9])
+LOG_ADD(LOG_FLOAT, n_in10, &world_state[10])
+LOG_ADD(LOG_FLOAT, n_in11, &world_state[11])
+LOG_ADD(LOG_FLOAT, n_in12, &world_state[12])
+LOG_ADD(LOG_FLOAT, n_out0, &indi_cmd[0])
+LOG_ADD(LOG_FLOAT, n_out1, &indi_cmd[1])
+LOG_ADD(LOG_FLOAT, n_out2, &indi_cmd[2])
+LOG_ADD(LOG_FLOAT, n_out3, &indi_cmd[3])
+
 
 LOG_GROUP_STOP(nncontrol)

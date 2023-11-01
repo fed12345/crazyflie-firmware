@@ -115,7 +115,7 @@ void appMain()
         }
       break;
     case WAIT_FOR_START:
-      crtpCommanderHighLevelGoTo(-2, -1.5, 1.5, 0, 5, false);
+      crtpCommanderHighLevelGoTo(-2, 1.5, 1.5, 0, 5, false);
       state = START_POS;
       break;
     case START_POS:
@@ -125,7 +125,7 @@ void appMain()
       }
       break;
     case WAIT_FOR_RACE:
-      crtpCommanderHighLevelGoTo(2, 1.5, 1.5, 0, 20, false);
+      crtpCommanderHighLevelGoTo(2, 1.5, 1.5, 0, 200, false);
       state = RACE;
       break;
     case RACE:
